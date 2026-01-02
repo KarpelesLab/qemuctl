@@ -375,55 +375,86 @@ func (i *Instance) Pause() error {
 }
 
 // Reset performs a hard reset of the VM.
+// This is equivalent to pressing the reset button - it's immediate and does not
+// give the guest OS a chance to shut down gracefully.
 func (i *Instance) Reset() error {
 	i.qmpMu.Lock()
 	qmp := i.qmp
 	i.qmpMu.Unlock()
 
 	if qmp == nil {
-		return fmt.Errorf("not connected")
+		return ErrNotConnected
 	}
 
 	_, err := qmp.Execute("system_reset", nil)
-	return err
+	if err != nil {
+		return fmt.Errorf("system_reset failed: %w", err)
+	}
+
+	return nil
 }
 
 // Stop performs a graceful shutdown, waiting for the guest to respond.
 // If the guest doesn't shut down within the timeout, it is forcefully killed.
+// Returns nil on successful shutdown, or an error if force stop was required.
 func (i *Instance) Stop(timeout time.Duration) error {
 	return i.StopContext(context.Background(), timeout)
 }
 
 // StopContext performs a graceful shutdown with context support.
+// It sends an ACPI power button event (system_powerdown) and waits for the
+// guest to shut down. If the guest doesn't respond within the timeout,
+// it forcefully terminates the QEMU process.
 func (i *Instance) StopContext(ctx context.Context, timeout time.Duration) error {
 	i.qmpMu.Lock()
 	qmp := i.qmp
 	i.qmpMu.Unlock()
 
-	// Try graceful shutdown first
-	if qmp != nil {
-		_, err := qmp.Execute("system_powerdown", nil)
-		if err == nil {
-			// Wait for graceful shutdown
-			deadline := time.Now().Add(timeout)
-			for time.Now().Before(deadline) {
-				select {
-				case <-ctx.Done():
-					return i.ForceStop()
-				default:
-				}
+	if qmp == nil {
+		// No QMP connection, just force stop
+		return i.ForceStop()
+	}
 
+	// Send ACPI power button event
+	_, err := qmp.Execute("system_powerdown", nil)
+	if err != nil {
+		// QMP command failed, force stop
+		i.ForceStop()
+		return fmt.Errorf("system_powerdown failed: %w", err)
+	}
+
+	// Wait for graceful shutdown
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			i.ForceStop()
+			return ctx.Err()
+		case <-ticker.C:
+			// Check if process has exited
+			if !i.isProcessAlive() {
+				i.cleanup()
+				return nil
+			}
+
+			// Check if we received SHUTDOWN event
+			if i.State() == StateShutdown {
+				// Guest has shut down, wait briefly for process to exit
+				time.Sleep(500 * time.Millisecond)
 				if !i.isProcessAlive() {
 					i.cleanup()
 					return nil
 				}
-				time.Sleep(500 * time.Millisecond)
 			}
 		}
 	}
 
-	// Timeout or QMP error, force stop
-	return i.ForceStop()
+	// Timeout reached, force stop
+	i.ForceStop()
+	return fmt.Errorf("graceful shutdown timed out after %v", timeout)
 }
 
 // Shutdown sends a powerdown request to the guest (ACPI power button).

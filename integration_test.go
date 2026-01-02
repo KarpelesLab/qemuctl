@@ -154,14 +154,37 @@ func TestIntegrationReset(t *testing.T) {
 		t.Fatalf("expected running state, got %s", inst.State())
 	}
 
+	// Set up event tracking to verify RESET event is received
+	var mu sync.Mutex
+	var resetEventReceived bool
+	inst.SetEventCallback(func(e *Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		t.Logf("Event received: %s", e.Name)
+		if e.Name == "RESET" {
+			resetEventReceived = true
+		}
+	})
+
 	// Reset
-	t.Log("Resetting VM...")
+	t.Log("Sending system_reset command...")
 	if err := inst.Reset(); err != nil {
 		t.Fatalf("Reset error: %v", err)
 	}
+	t.Log("system_reset command completed successfully")
+
+	// Wait for RESET event
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	gotReset := resetEventReceived
+	mu.Unlock()
+
+	if !gotReset {
+		t.Error("expected RESET event but did not receive it")
+	}
 
 	// Should still be running after reset
-	time.Sleep(100 * time.Millisecond)
 	if err := inst.QueryState(); err != nil {
 		t.Fatalf("QueryState after reset error: %v", err)
 	}
@@ -571,11 +594,16 @@ func TestIntegrationGracefulStop(t *testing.T) {
 	// Since there's no OS, ACPI shutdown won't work, so it should force stop
 	t.Log("Testing graceful stop (will timeout and force stop)...")
 	start := time.Now()
-	if err := inst.Stop(1 * time.Second); err != nil {
-		t.Logf("Stop returned error (may be expected): %v", err)
-	}
+	err := inst.Stop(1 * time.Second)
 	elapsed := time.Since(start)
 	t.Logf("Stop took %v", elapsed)
+
+	// Should return timeout error since no guest OS to respond
+	if err == nil {
+		t.Log("Stop returned nil (unexpected - no guest OS to shut down)")
+	} else {
+		t.Logf("Stop returned error (expected): %v", err)
+	}
 
 	// Should have waited at least close to the timeout
 	if elapsed < 900*time.Millisecond {
@@ -587,6 +615,56 @@ func TestIntegrationGracefulStop(t *testing.T) {
 	if err := checkProcessExists(pid); err == nil {
 		t.Error("process should not exist after stop")
 	}
+}
+
+func TestIntegrationShutdownCommand(t *testing.T) {
+	skipIfNoQemu(t)
+
+	inst, cleanup := startTestVM(t, "test-shutdown-cmd")
+	defer cleanup()
+
+	// Verify running
+	if err := inst.QueryState(); err != nil {
+		t.Fatalf("QueryState error: %v", err)
+	}
+
+	// Track POWERDOWN event
+	var mu sync.Mutex
+	var powerdownReceived bool
+	inst.SetEventCallback(func(e *Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		t.Logf("Event received: %s", e.Name)
+		if e.Name == "POWERDOWN" {
+			powerdownReceived = true
+		}
+	})
+
+	// Send shutdown command (ACPI power button)
+	t.Log("Sending system_powerdown command...")
+	if err := inst.Shutdown(); err != nil {
+		t.Fatalf("Shutdown error: %v", err)
+	}
+	t.Log("system_powerdown command completed successfully")
+
+	// Wait for POWERDOWN event
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	gotPowerdown := powerdownReceived
+	mu.Unlock()
+
+	if !gotPowerdown {
+		t.Error("expected POWERDOWN event but did not receive it - system_powerdown may not be working")
+	} else {
+		t.Log("POWERDOWN event received - ACPI power button signal sent successfully")
+	}
+
+	// VM should still be running (no guest OS to respond to ACPI)
+	if err := inst.QueryState(); err != nil {
+		t.Fatalf("QueryState after shutdown error: %v", err)
+	}
+	t.Logf("State after shutdown command: %s", inst.State())
 }
 
 func TestIntegrationSendKey(t *testing.T) {
